@@ -8,41 +8,43 @@ import android.media.RingtoneManager
 import android.net.Uri
 import android.os.*
 import android.text.TextUtils
+import android.util.Log
 
 class CallkitSoundPlayerManager(private val context: Context) {
 
+    companion object {
+        private const val TAG = "CallkitSoundPlayerManager"
+    }
+
     private var vibrator: Vibrator? = null
     private var audioManager: AudioManager? = null
-
     private var mediaPlayer: MediaPlayer? = null
 
     fun play(data: Bundle) {
-        this.prepare()
-        this.playSound(data)
-        this.playVibrator()
+        prepare()
+        playSound(data)
+        playVibrator()
     }
 
     fun stop() {
-        mediaPlayer?.stop()
-        mediaPlayer?.release()
+        mediaPlayer?.run {
+            stop()
+            release()
+        }
         vibrator?.cancel()
-
         mediaPlayer = null
         vibrator = null
     }
 
     fun destroy() {
-        mediaPlayer?.stop()
-        mediaPlayer?.release()
-        vibrator?.cancel()
-
-        mediaPlayer = null
-        vibrator = null
+        stop()
     }
 
     private fun prepare() {
-        mediaPlayer?.stop()
-        mediaPlayer?.release()
+        mediaPlayer?.run {
+            stop()
+            release()
+        }
         vibrator?.cancel()
     }
 
@@ -55,115 +57,105 @@ class CallkitSoundPlayerManager(private val context: Context) {
             context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         }
         audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        when (audioManager?.ringerMode) {
-            AudioManager.RINGER_MODE_SILENT -> {
-            }
-
-            else -> {
+        if (audioManager?.ringerMode != AudioManager.RINGER_MODE_SILENT) {
+            vibrator?.let {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    vibrator?.vibrate(
-                        VibrationEffect.createWaveform(
-                            longArrayOf(0L, 1000L, 1000L),
-                            0
-                        )
-                    )
+                    it.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 1000, 1000), 0))
                 } else {
-                    vibrator?.vibrate(longArrayOf(0L, 1000L, 1000L), 0)
+                    it.vibrate(longArrayOf(0, 1000, 1000), 0)
                 }
             }
         }
     }
 
     private fun playSound(data: Bundle?) {
-        val sound = data?.getString(
+        val soundPath = data?.getString(
             CallkitConstants.EXTRA_CALLKIT_RINGTONE_PATH,
             ""
         )
-        val uri = sound?.let { getRingtoneUri(it) }
+        val uri = soundPath?.let { getRingtoneUri(it) }
         if (uri == null) {
-            // Failed to get ringtone url, can't play sound
+            Log.e(TAG, "Failed to get ringtone URI for soundPath=$soundPath")
             return
         }
         try {
-            mediaPlayer(uri)
+            initializeMediaPlayer(uri)
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.e(TAG, "Error playing sound", e)
         }
     }
 
-    private fun mediaPlayer(uri: Uri) {
-        mediaPlayer = MediaPlayer()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            val attribution = AudioAttributes.Builder()
-                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
-                .setLegacyStreamType(AudioManager.STREAM_RING)
-                .build()
-            mediaPlayer?.setAudioAttributes(attribution)
-        } else {
-            mediaPlayer?.setAudioStreamType(AudioManager.STREAM_RING)
-        }
-        setDataSource(uri)
-        mediaPlayer?.prepare()
-        mediaPlayer?.isLooping = true
-        mediaPlayer?.start()
-    }
-
-    private fun setDataSource(uri: Uri) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            val assetFileDescriptor =
-                context.contentResolver.openAssetFileDescriptor(uri, "r")
-            if (assetFileDescriptor != null) {
-                mediaPlayer?.setDataSource(assetFileDescriptor)
+    private fun initializeMediaPlayer(uri: Uri) {
+        mediaPlayer = MediaPlayer().apply {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                val attributes = AudioAttributes.Builder()
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                    .setLegacyStreamType(AudioManager.STREAM_RING)
+                    .build()
+                setAudioAttributes(attributes)
+            } else {
+                setAudioStreamType(AudioManager.STREAM_RING)
             }
-            return
+            setDataSourceFromUri(uri)
+            isLooping = true
+            prepare()
+            start()
         }
+    }
+
+    private fun setDataSourceFromUri(uri: Uri) {
+        // Try AssetFileDescriptor-based source first
+        try {
+            context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { afd ->
+                mediaPlayer?.setDataSource(
+                    afd.fileDescriptor,
+                    afd.startOffset,
+                    afd.length
+                )
+                return
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "AFD data source failed, falling back to URI", e)
+        }
+        // Fallback to URI-based source
         mediaPlayer?.setDataSource(context, uri)
     }
 
     private fun getRingtoneUri(fileName: String): Uri? {
-        if (TextUtils.isEmpty(fileName)) {
+        if (fileName.isBlank()) {
             return getDefaultRingtoneUri()
         }
-        
-        // If system_ringtone_default is explicitly requested, bypass resource check
-        if (fileName.equals("system_ringtone_default", true)) {
-            return getDefaultRingtoneUri(useSystemDefault = true)
-        }
-
-        try {
-            val resId = context.resources.getIdentifier(fileName, "raw", context.packageName)
-            if (resId != 0) {
-                return Uri.parse("android.resource://${context.packageName}/$resId")
+        return if (fileName.equals("system_ringtone_default", ignoreCase = true)) {
+            getDefaultRingtoneUri(useSystemDefault = true)
+        } else {
+            try {
+                val resId = context.resources.getIdentifier(fileName, "raw", context.packageName)
+                if (resId != 0) {
+                    Uri.parse("android.resource://${context.packageName}/$resId")
+                } else {
+                    getDefaultRingtoneUri()
+                }
+            } catch (e: Exception) {
+                getDefaultRingtoneUri()
             }
-
-            // For any other unresolved filename, return the default ringtone
-            return getDefaultRingtoneUri()
-        } catch (e: Exception) {
-            // If anything fails, try to return the system default ringtone
-            return getDefaultRingtoneUri()
         }
     }
 
     private fun getDefaultRingtoneUri(useSystemDefault: Boolean = false): Uri? {
-        try {
+        return try {
             if (!useSystemDefault) {
-                // First try to use ringtone_default resource if it exists
                 val resId = context.resources.getIdentifier("ringtone_default", "raw", context.packageName)
                 if (resId != 0) {
-                    return Uri.parse("android.resource://${context.packageName}/$resId")
+                    Uri.parse("android.resource://${context.packageName}/$resId")
+                } else {
+                    RingtoneManager.getActualDefaultRingtoneUri(context, RingtoneManager.TYPE_RINGTONE)
                 }
+            } else {
+                RingtoneManager.getActualDefaultRingtoneUri(context, RingtoneManager.TYPE_RINGTONE)
             }
-
-            // Fall back to system default ringtone
-            return RingtoneManager.getActualDefaultRingtoneUri(
-                context,
-                RingtoneManager.TYPE_RINGTONE
-            )
         } catch (e: Exception) {
-            // getActualDefaultRingtoneUri can throw an exception on some devices
-            // for custom ringtones
-            return null
+            null
         }
     }
 }
